@@ -1,5 +1,6 @@
 from pathlib import Path
 import io
+import math
 import re
 
 import folium
@@ -64,8 +65,10 @@ def clean_data(df):
     base_min = df.get("기본 주차 시간(분 단위)", pd.Series(float("nan"), index=df.index))
     add_fee = df.get("추가 단위 요금", pd.Series(float("nan"), index=df.index)).fillna(0)
     add_min = df.get("추가 단위 시간(분 단위)", pd.Series(float("nan"), index=df.index))
-    extra_units = ((60 - base_min).clip(lower=0) / add_min).apply(
-        lambda x: int(-(-x // 1)) if pd.notna(x) and x != float("inf") else 0
+    # 추가 단위 시간이 0/결측인 행은 추가요금을 계산하지 않는다.
+    safe_add_min = add_min.where(add_min.gt(0))
+    extra_units = ((60 - base_min).clip(lower=0) / safe_add_min).apply(
+        lambda x: math.ceil(x) if pd.notna(x) and math.isfinite(x) else 0
     )
     df["60분 예상 요금"] = base_fee + extra_units * add_fee
     df.loc[df["무료 여부"], "60분 예상 요금"] = 0
@@ -86,8 +89,11 @@ def hhmm(value):
     return f"{value // 100:02d}:{value % 100:02d}"
 
 
-def make_map(df):
+def make_map(df, marker_limit=400):
     located = df.dropna(subset=["위도", "경도"])
+    total_located = len(located)
+    # 너무 많은 HTML 마커는 Streamlit 화면을 멈추게 할 수 있어 표시 수를 제한한다.
+    located = located.head(marker_limit)
     center = [located["위도"].mean(), located["경도"].mean()] if len(located) else [37.5665, 126.9780]
     fmap = folium.Map(location=center, zoom_start=12, tiles="CartoDB positron")
     cluster = MarkerCluster(name="공영주차장").add_to(fmap)
@@ -111,4 +117,100 @@ def make_map(df):
             [row["위도"], row["경도"]], tooltip=tooltip, popup=popup,
             icon=folium.Icon(color=color, icon="car", prefix="fa"),
         ).add_to(cluster)
-    return fmap, len(located)
+    return fmap, len(located), total_located
+
+
+st.title("🅿️ 서울 공영주차장 찾기")
+st.caption("주소·요금·운영 정보를 비교하고, 자치구별 저렴한 주차장을 찾아보세요.")
+
+with st.sidebar:
+    st.header("데이터")
+    uploaded = st.file_uploader("공영주차장 CSV 업로드", type=["csv"], help="UTF-8 또는 CP949 CSV를 지원합니다.")
+
+try:
+    df, encoding = read_csv(uploaded if uploaded is not None else DEFAULT_CSV)
+    df = clean_data(df)
+except Exception as exc:
+    st.error(f"데이터를 불러오지 못했습니다: {exc}")
+    st.stop()
+
+districts = sorted(x for x in df["자치구"].unique() if x != "구 정보 없음")
+with st.sidebar:
+    st.success(f"{len(df):,}개 주차장 · {encoding.upper()}")
+    district = st.selectbox("자치구", ["전체"] + districts)
+    query = st.text_input("주차장명 또는 주소 검색")
+    fee_mode = st.radio("요금", ["전체", "무료만", "유료만"], horizontal=True)
+    weekend_only = st.checkbox("주말 운영 정보가 있는 곳만")
+    max_hour = st.number_input("60분 예상 요금 상한(원, 0은 제한 없음)", min_value=0, value=0, step=500)
+    marker_limit = st.select_slider("지도에 표시할 최대 마커", options=[100, 200, 300, 400], value=300)
+
+filtered = df.copy()
+if district != "전체":
+    filtered = filtered[filtered["자치구"] == district]
+if query:
+    mask = (
+        filtered["주차장명"].fillna("").str.contains(re.escape(query), case=False)
+        | filtered["주소"].fillna("").str.contains(re.escape(query), case=False)
+    )
+    filtered = filtered[mask]
+if fee_mode == "무료만":
+    filtered = filtered[filtered["무료 여부"]]
+elif fee_mode == "유료만":
+    filtered = filtered[~filtered["무료 여부"]]
+if weekend_only:
+    filtered = filtered[filtered["주말 운영"]]
+if max_hour > 0:
+    filtered = filtered[filtered["60분 예상 요금"].le(max_hour)]
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("검색 결과", f"{len(filtered):,}곳")
+c2.metric("무료", f"{int(filtered['무료 여부'].sum()):,}곳")
+c3.metric("주말 정보 있음", f"{int(filtered['주말 운영'].sum()):,}곳")
+c4.metric("좌표 보유", f"{filtered[['위도', '경도']].notna().all(axis=1).sum():,}곳")
+
+st.subheader("추천: 선택 지역의 최저 요금")
+priced = filtered.dropna(subset=["60분 예상 요금"]).sort_values(["60분 예상 요금", "기본 주차 요금", "주차장명"])
+if priced.empty:
+    st.info("현재 조건에서 요금을 비교할 수 있는 주차장이 없습니다.")
+else:
+    cheapest_fee = priced.iloc[0]["60분 예상 요금"]
+    cheapest = priced[priced["60분 예상 요금"] == cheapest_fee].head(5)
+    st.success(f"60분 예상 요금 최저: {won(cheapest_fee)} · 동률 최대 5곳 표시")
+    st.dataframe(
+        cheapest[["주차장명", "주소", "유무료구분명", "기본 주차 요금", "기본 주차 시간(분 단위)", "60분 예상 요금"]],
+        use_container_width=True, hide_index=True,
+    )
+
+st.subheader("지도")
+fmap, mapped_count, total_located = make_map(filtered, marker_limit)
+st_folium(fmap, use_container_width=True, height=580, key="parking_map")
+if total_located > mapped_count:
+    st.info(
+        f"빠른 화면 표시를 위해 좌표가 있는 {total_located:,}곳 중 {mapped_count:,}곳만 지도에 표시했습니다. "
+        "자치구나 검색 조건을 선택하면 원하는 지역을 모두 확인하기 쉽습니다."
+    )
+missing_coords = len(filtered) - total_located
+if missing_coords:
+    st.caption(f"위도·경도가 없는 {missing_coords:,}곳은 지도에서 제외되었습니다. 아래 표에서는 확인할 수 있습니다.")
+
+st.subheader("상세 정보")
+display_cols = [c for c in [
+    "주차장명", "자치구", "주소", "유무료구분명", "60분 예상 요금", "일 최대 요금",
+    "총 주차면", "주차장 종류명", "운영구분명", "야간무료개방여부명", "전화번호"
+] if c in filtered.columns]
+st.dataframe(filtered[display_cols].sort_values(["60분 예상 요금", "주차장명"], na_position="last"), use_container_width=True, hide_index=True)
+
+download = filtered[display_cols].to_csv(index=False).encode("utf-8-sig")
+st.download_button("검색 결과 CSV 내려받기", download, "공영주차장_검색결과.csv", "text/csv")
+
+with st.expander("요금 비교 기준과 데이터 안내"):
+    st.write(
+        "60분 예상 요금은 기본 요금에 60분까지 필요한 추가 단위 요금을 올림하여 더한 값입니다. "
+        "실제 요금은 입·출차 시각, 감면, 운영 정책에 따라 달라질 수 있습니다. "
+        "주말 운영 여부는 주말 운영시간 또는 토요일 요금 정보가 기록되어 있는지를 기준으로 표시합니다."
+    )
+
+
+    
+
+
