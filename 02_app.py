@@ -287,4 +287,4 @@ with tab3:
         """)
 
 st.divider()
-st.caption("교육용 모형 · 실제 화학 실험은 학교의 안전 규정과 교사의 지도에 따라 수행해야 합니다.")
+st.caption("야르")
