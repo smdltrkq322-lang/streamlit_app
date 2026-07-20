@@ -14,11 +14,13 @@ from wordcloud import WordCloud
 
 st.set_page_config(page_title="유튜브 댓글 분석기", page_icon="▶️", layout="wide")
 
+APP_DIR = Path(__file__).resolve().parent
+
 FONT_CANDIDATES = [
-    Path("NanumGothic.ttf"),
-    Path("fonts/NanumGothic.ttf"),
-    Path("NanumGothic-Regular.ttf"),
-    Path("fonts/NanumGothic-Regular.ttf"),
+    APP_DIR / "NanumGothic.ttf",
+    APP_DIR / "fonts" / "NanumGothic.ttf",
+    APP_DIR / "NanumGothic-Regular.ttf",
+    APP_DIR / "fonts" / "NanumGothic-Regular.ttf",
 ]
 
 POSITIVE_WORDS = {
